@@ -84,6 +84,15 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
   });
 });
 
+
+// OAuth protected resource metadata (MCP 2025-03-26)
+app.use((req, res, next) => {
+  if (req.path.startsWith('/.well-known/oauth-protected-resource')) {
+    return res.json({ resource: ISSUER, authorization_servers: [ISSUER] });
+  }
+  next();
+});
+
 // Authorization endpoint
 app.get('/oauth/authorize', (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = req.query;
