@@ -44,10 +44,12 @@ function requireBearer(req, res, next) {
 // ── Proxy helper (SSE-aware) ──────────────────────────────────────────────────
 function proxyRequest(req, res) {
   const target = new URL(UPSTREAM);
+  // Reconstruct full path including query string
+  const fullPath = req.originalUrl || req.url;
   const options = {
     hostname: target.hostname,
     port:     target.port || 80,
-    path:     req.url,
+    path:     fullPath,
     method:   req.method,
     headers:  { ...req.headers, host: target.host },
   };
@@ -154,9 +156,13 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', upstream: UPSTREAM, sessions: accessTokens.size });
 });
 
-// MCP proxy (protected)
-app.use('/sse',      requireBearer, proxyRequest);
-app.use('/messages', requireBearer, proxyRequest);
+// MCP proxy (protected) - explicit methods to preserve req.url
+app.get('/sse',          requireBearer, proxyRequest);
+app.post('/sse',         requireBearer, proxyRequest);
+app.get('/messages',     requireBearer, proxyRequest);
+app.post('/messages',    requireBearer, proxyRequest);
+app.get('/messages/',    requireBearer, proxyRequest);
+app.post('/messages/',   requireBearer, proxyRequest);
 
 // Fallback
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
