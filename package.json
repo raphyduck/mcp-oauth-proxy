@@ -1,0 +1,17 @@
+{
+  "name": "mcp-oauth-proxy",
+  "version": "1.0.0",
+  "description": "OAuth 2.0 + PKCE proxy for stdio MCP servers, compatible with claude.ai connectors",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
