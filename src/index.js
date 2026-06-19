@@ -21,7 +21,7 @@ const REFRESH_TTL   = parseInt(process.env.OAUTH_REFRESH_TTL ?? '15552000'); // 
 
 // Persist tokens so they survive a container restart/recreate. Keyed by PORT so
 // several proxy instances can share one host directory without colliding.
-const DATA_DIR      = process.env.OAUTH_DATA_DIR ?? '/opt/oauth-proxy/data';
+const DATA_DIR      = process.env.OAUTH_DATA_DIR ?? '/data';
 const TOKENS_FILE   = path.join(DATA_DIR, `tokens-${PORT}.json`);
 
 if (!CLIENT_SECRET) { console.error('ERROR: OAUTH_CLIENT_SECRET required'); process.exit(1); }
