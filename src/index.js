@@ -2,7 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
-import { createServer } from 'http';
+import fs from 'fs';
+import path from 'path';
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const PORT          = parseInt(process.env.PROXY_PORT    ?? '3002');
@@ -12,15 +13,69 @@ const CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET    ?? '';
 const MCP_COMMAND   = process.env.MCP_COMMAND            ?? '';
 const MCP_ARGS      = (process.env.MCP_ARGS ?? '').split(' ').filter(Boolean);
 
+// Token lifetimes (seconds). Access tokens are short-lived; refresh tokens are
+// long-lived and NON-rotating, so a client can silently renew for months
+// without a full re-authorization.
+const ACCESS_TTL    = parseInt(process.env.OAUTH_ACCESS_TTL  ?? '3600');     // 1h
+const REFRESH_TTL   = parseInt(process.env.OAUTH_REFRESH_TTL ?? '15552000'); // 180d
+
+// Persist tokens so they survive a container restart/recreate. Keyed by PORT so
+// several proxy instances can share one host directory without colliding.
+const DATA_DIR      = process.env.OAUTH_DATA_DIR ?? '/opt/oauth-proxy/data';
+const TOKENS_FILE   = path.join(DATA_DIR, `tokens-${PORT}.json`);
+
 if (!CLIENT_SECRET) { console.error('ERROR: OAUTH_CLIENT_SECRET required'); process.exit(1); }
 if (!MCP_COMMAND)   { console.error('ERROR: MCP_COMMAND required');          process.exit(1); }
 
 // ── Stores ────────────────────────────────────────────────────────────────────
-const authCodes    = new Map();
-const accessTokens = new Map();
+const authCodes     = new Map(); // code  -> { redirect_uri, code_challenge, exp }
+const accessTokens  = new Map(); // token -> expMs
+const refreshTokens = new Map(); // token -> expMs
 
 // sessionId -> { proc, pendingRequests: Map<id, {resolve,reject}>, buffer: string }
-const sessions     = new Map();
+const sessions      = new Map();
+
+// ── Token persistence ─────────────────────────────────────────────────────────
+function loadTokens() {
+  try {
+    const data = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
+    const now = Date.now();
+    for (const [t, exp] of Object.entries(data.accessTokens  ?? {})) if (exp > now) accessTokens.set(t, exp);
+    for (const [t, exp] of Object.entries(data.refreshTokens ?? {})) if (exp > now) refreshTokens.set(t, exp);
+    console.log(`Loaded tokens: ${accessTokens.size} access, ${refreshTokens.size} refresh`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error('Token load error:', err.message);
+  }
+}
+
+let persistTimer = null;
+function persistTokens() {
+  // Debounce bursts of mutations into a single atomic write (tmp + rename).
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      const data = {
+        accessTokens:  Object.fromEntries(accessTokens),
+        refreshTokens: Object.fromEntries(refreshTokens),
+      };
+      const tmp = `${TOKENS_FILE}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(data), { mode: 0o600 });
+      fs.renameSync(tmp, TOKENS_FILE);
+    } catch (err) {
+      console.error('Token persist error:', err.message);
+    }
+  }, 250);
+}
+
+function pruneExpired() {
+  const now = Date.now();
+  let changed = false;
+  for (const [t, exp] of accessTokens)  if (exp <= now) { accessTokens.delete(t);  changed = true; }
+  for (const [t, exp] of refreshTokens) if (exp <= now) { refreshTokens.delete(t); changed = true; }
+  if (changed) persistTokens();
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const rand = () => crypto.randomBytes(32).toString('hex');
@@ -29,12 +84,25 @@ function verifyPKCE(verifier, challenge) {
   return crypto.createHash('sha256').update(verifier).digest('base64url') === challenge;
 }
 
+function mintAccess() {
+  const token = rand();
+  accessTokens.set(token, Date.now() + ACCESS_TTL * 1000);
+  return token;
+}
+
+function mintRefresh() {
+  const token = rand();
+  refreshTokens.set(token, Date.now() + REFRESH_TTL * 1000);
+  return token;
+}
+
 function requireBearer(req, res, next) {
+  if (process.env.STATIC_MCP_TOKEN && req.headers['authorization'] === `Bearer ${process.env.STATIC_MCP_TOKEN}`) return next();
   const h = req.headers['authorization'] ?? '';
   const t = h.startsWith('Bearer ') ? h.slice(7) : null;
   if (!t) return res.status(401).json({ error: 'unauthorized' });
   const exp = accessTokens.get(t);
-  if (!exp || Date.now() > exp) { accessTokens.delete(t); return res.status(401).json({ error: 'token_expired' }); }
+  if (!exp || Date.now() > exp) { if (exp) { accessTokens.delete(t); persistTokens(); } return res.status(401).json({ error: 'token_expired' }); }
   next();
 }
 
@@ -115,7 +183,7 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
     token_endpoint:                        `${ISSUER}/oauth/token`,
     response_types_supported:              ['code'],
     code_challenge_methods_supported:      ['S256'],
-    grant_types_supported:                 ['authorization_code'],
+    grant_types_supported:                 ['authorization_code', 'refresh_token'],
     token_endpoint_auth_methods_supported: ['client_secret_post'],
   });
 });
@@ -136,24 +204,37 @@ app.get('/oauth/authorize', (req, res) => {
 
 // Token
 app.post('/oauth/token', (req, res) => {
-  const { grant_type, code, redirect_uri, client_id, client_secret, code_verifier } = req.body;
+  const { grant_type, code, redirect_uri, client_id, client_secret, code_verifier, refresh_token } = req.body;
   if (client_id !== CLIENT_ID || client_secret !== CLIENT_SECRET)
     return res.status(401).json({ error: 'invalid_client' });
-  if (grant_type !== 'authorization_code')
-    return res.status(400).json({ error: 'unsupported_grant_type' });
-  const stored = authCodes.get(code);
-  if (!stored || Date.now() > stored.exp) { authCodes.delete(code); return res.status(400).json({ error: 'invalid_grant' }); }
-  if (stored.redirect_uri !== redirect_uri) return res.status(400).json({ error: 'invalid_grant' });
-  if (!verifyPKCE(code_verifier, stored.code_challenge)) return res.status(400).json({ error: 'invalid_grant' });
-  authCodes.delete(code);
-  const token = rand();
-  accessTokens.set(token, Date.now() + 86_400_000);
-  res.json({ access_token: token, token_type: 'Bearer', expires_in: 86400 });
+
+  if (grant_type === 'authorization_code') {
+    const stored = authCodes.get(code);
+    if (!stored || Date.now() > stored.exp) { authCodes.delete(code); return res.status(400).json({ error: 'invalid_grant' }); }
+    if (stored.redirect_uri !== redirect_uri) return res.status(400).json({ error: 'invalid_grant' });
+    if (!verifyPKCE(code_verifier, stored.code_challenge)) return res.status(400).json({ error: 'invalid_grant' });
+    authCodes.delete(code);
+    const access  = mintAccess();
+    const refresh = mintRefresh();
+    persistTokens();
+    return res.json({ access_token: access, token_type: 'Bearer', expires_in: ACCESS_TTL, refresh_token: refresh });
+  }
+
+  if (grant_type === 'refresh_token') {
+    const exp = refreshTokens.get(refresh_token);
+    if (!exp || Date.now() > exp) { if (exp) { refreshTokens.delete(refresh_token); persistTokens(); } return res.status(400).json({ error: 'invalid_grant' }); }
+    // Non-rotating: keep the same refresh token, mint a fresh access token.
+    const access = mintAccess();
+    persistTokens();
+    return res.json({ access_token: access, token_type: 'Bearer', expires_in: ACCESS_TTL, refresh_token });
+  }
+
+  return res.status(400).json({ error: 'unsupported_grant_type' });
 });
 
 // Health
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', sessions: sessions.size, tokens: accessTokens.size });
+  res.json({ status: 'ok', sessions: sessions.size, tokens: accessTokens.size, refreshTokens: refreshTokens.size });
 });
 
 // ── MCP /mcp endpoint ─────────────────────────────────────────────────────────
@@ -229,8 +310,13 @@ app.get('/mcp', requireBearer, (req, res) => {
 
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
 
+// Load persisted tokens before accepting traffic, then prune periodically.
+loadTokens();
+setInterval(pruneExpired, 60_000).unref?.();
+
 app.listen(PORT, () => {
   console.log(`mcp-oauth-proxy on :${PORT}/mcp`);
   console.log(`Command: ${MCP_COMMAND} ${MCP_ARGS.join(' ')}`);
   console.log(`Issuer:  ${ISSUER}`);
+  console.log(`Tokens:  access ${ACCESS_TTL}s / refresh ${REFRESH_TTL}s, persisted at ${TOKENS_FILE}`);
 });
