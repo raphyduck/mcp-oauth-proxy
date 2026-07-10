@@ -96,13 +96,18 @@ function mintRefresh() {
   return token;
 }
 
+function send401(res, err) {
+  res.set('WWW-Authenticate', `Bearer resource_metadata="${ISSUER}/.well-known/oauth-protected-resource", error="${err}"`);
+  return res.status(401).json({ error: err });
+}
+
 function requireBearer(req, res, next) {
   if (process.env.STATIC_MCP_TOKEN && req.headers['authorization'] === `Bearer ${process.env.STATIC_MCP_TOKEN}`) return next();
   const h = req.headers['authorization'] ?? '';
   const t = h.startsWith('Bearer ') ? h.slice(7) : null;
-  if (!t) return res.status(401).json({ error: 'unauthorized' });
+  if (!t) return send401(res, 'unauthorized');
   const exp = accessTokens.get(t);
-  if (!exp || Date.now() > exp) { if (exp) { accessTokens.delete(t); persistTokens(); } return res.status(401).json({ error: 'token_expired' }); }
+  if (!exp || Date.now() > exp) { if (exp) { accessTokens.delete(t); persistTokens(); } return send401(res, 'token_expired'); }
   next();
 }
 
